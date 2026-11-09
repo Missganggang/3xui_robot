@@ -1,0 +1,4 @@
+# Replace with the website's own domain, not a customer's panel domain.
+console.example.com {
+    reverse_proxy 127.0.0.1:8000
+}

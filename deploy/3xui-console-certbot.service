@@ -1,0 +1,10 @@
+[Unit]
+Description=Renew 3x-ui console IP TLS certificate
+Wants=network-online.target
+After=network-online.target nginx.service
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/opt/3xui-console/certbot/bin/certbot renew --quiet --no-random-sleep-on-renew --cert-name 3xui-console-ip --deploy-hook "/usr/sbin/nginx -t && /usr/bin/systemctl reload nginx"

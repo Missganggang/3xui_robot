@@ -1,0 +1,10 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.32,<1
+asyncssh>=2.20,<3
+cryptography>=44,<49
+python-multipart>=0.0.20,<1
+jinja2>=3.1.6,<4
+httpx>=0.28,<1
+idna>=3.10,<4
+itsdangerous>=2.2,<3
+python-dotenv>=1.0,<2
