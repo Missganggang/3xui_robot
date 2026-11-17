@@ -213,8 +213,53 @@ def test_cross_version_is_rejected_before_accessing_file(tmp_path, source, targe
 
 
 def test_declared_version_cannot_silently_downgrade_v3_database(tmp_path):
-    with pytest.raises(MigrationError, match="降级"):
-        validate_database(make_db(tmp_path / "v3.db", "3.4.2"), "2.9.4", "2.9.4")
+    path = make_db(tmp_path / "v3.db", "3.4.2")
+    before = path.read_bytes()
+    with pytest.raises(MigrationError, match="客户数据遗漏") as caught:
+        validate_database(path, "2.9.4", "2.9.4")
+    message = str(caught.value)
+    assert "2.9.4 → 2.9.4" in message and "clients 有 3 条记录" in message
+    assert "精确版本" in message and "不要自行删除" in message
+    assert not any(value in message for value in ("old-admin", "old-password-hash", "original-private-otp-secret"))
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("tables", [("clients",), ("client_inbounds",), ("clients", "client_inbounds")])
+def test_v2_accepts_empty_residual_client_tables_without_modifying_snapshot(tmp_path, tables):
+    path = make_db(tmp_path / "residual.db")
+    with sqlite3.connect(path) as db:
+        if "clients" in tables:
+            db.execute("CREATE TABLE clients (id INTEGER PRIMARY KEY, email TEXT)")
+        if "client_inbounds" in tables:
+            db.execute("CREATE TABLE client_inbounds (client_id INTEGER, inbound_id INTEGER)")
+    before, files = path.read_bytes(), set(tmp_path.iterdir())
+    result = validate_database(path, "2.9.4", "2.9.4")
+    assert result["clients"] == 2 and result["client_count_kind"] == "入站客户条目"
+    assert result["panel_settings"] == {"port": 8443, "path": "/legacy/"}
+    assert any("历史版本遗留" in message for message in result["warnings"])
+    assert path.read_bytes() == before and set(tmp_path.iterdir()) == files
+
+
+@pytest.mark.parametrize("has_clients_table", [False, True])
+def test_v2_rejects_nonempty_client_links_even_if_clients_missing_or_empty(tmp_path, has_clients_table):
+    path = make_db(tmp_path / "orphan-links.db")
+    with sqlite3.connect(path) as db:
+        if has_clients_table:
+            db.execute("CREATE TABLE clients (id INTEGER PRIMARY KEY, email TEXT)")
+        db.execute("CREATE TABLE client_inbounds (client_id INTEGER, inbound_id INTEGER)")
+        db.execute("INSERT INTO client_inbounds VALUES (1,1)")
+    with pytest.raises(MigrationError, match="client_inbounds 有 1 条关联"):
+        validate_database(path, "2.9.4", "2.9.4")
+
+
+@pytest.mark.parametrize("table", ["Clients", "Client_Inbounds"])
+def test_nonempty_residual_table_detection_matches_sqlite_identifier_case_rules(tmp_path, table):
+    path = make_db(tmp_path / "mixed-case.db")
+    with sqlite3.connect(path) as db:
+        db.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)")
+        db.execute(f"INSERT INTO {table} VALUES (1)")
+    with pytest.raises(MigrationError, match="客户数据遗漏"):
+        validate_database(path, "2.9.4", "2.9.4")
 
 
 def test_declared_v3_requires_clients_table(tmp_path):

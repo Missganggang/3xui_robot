@@ -152,6 +152,62 @@ def test_database_upload_and_no_cross_version(console, tmp_path):
     assert len(list((tmp_path / "uploads").glob("*.db"))) == 1
 
 
+@pytest.mark.parametrize("empty_tables", [
+    ("clients",), ("client_inbounds",), ("clients", "client_inbounds"),
+])
+def test_v294_upload_accepts_empty_residual_client_tables_and_counts_inbound_json(console, tmp_path, empty_tables):
+    app, client = console
+    headers = login(client)
+    source = tmp_path / "empty-residual-tables.db"
+    sample_db(source)
+    with sqlite3.connect(source) as db:
+        if "clients" in empty_tables:
+            db.execute("CREATE TABLE clients(id INTEGER PRIMARY KEY,email TEXT)")
+        if "client_inbounds" in empty_tables:
+            db.execute("CREATE TABLE client_inbounds(client_id INTEGER,inbound_id INTEGER)")
+    before = source.read_bytes()
+    response = client.post("/api/tasks", data=task_data(kind="migrate", source_version="v2.9.4"),
+                           files={"database": ("x-ui.db", before)}, headers=headers)
+    assert response.status_code == 201, response.text
+    task = response.json()["task"]
+    assert task["status"] == "queued"
+    assert task["validation"]["inbounds"] == 1
+    assert task["validation"]["clients"] == 1
+    assert task["validation"]["client_count_kind"] == "入站客户条目"
+    assert any("空的独立客户数据表" in warning for warning in task["validation"]["warnings"])
+    saved = app.state.store.task(task["id"])
+    assert len(app.state.store.tasks(None)) == 1
+    assert Path(saved["upload_path"]).read_bytes() == before
+    assert source.read_bytes() == before
+
+
+@pytest.mark.parametrize("populated_table", ["clients", "client_inbounds"])
+def test_v294_upload_rejects_independent_clients_or_orphan_links_without_retaining_upload(console, tmp_path, populated_table):
+    app, client = console
+    headers = login(client)
+    source = tmp_path / "independent-clients.db"
+    sample_db(source)
+    with sqlite3.connect(source) as db:
+        db.execute("CREATE TABLE clients(id INTEGER PRIMARY KEY,email TEXT)")
+        db.execute("CREATE TABLE client_inbounds(client_id INTEGER,inbound_id INTEGER)")
+        if populated_table == "clients":
+            db.execute("INSERT INTO clients VALUES(1,'test-only-independent-client')")
+        else:
+            # The table can have relationships even when its clients are absent.
+            db.execute("INSERT INTO client_inbounds VALUES(99,1)")
+    before = source.read_bytes()
+    response = client.post("/api/tasks", data=task_data(kind="migrate", source_version="v2.9.4"),
+                           files={"database": ("x-ui.db", before)}, headers=headers)
+    assert response.status_code == 422
+    assert "不能确认这些独立记录也能恢复" in response.json()["detail"]
+    assert "数据库包含 3.x 客户数据表" not in response.text
+    assert "test-only-independent-client" not in response.text
+    assert "test-only-ssh-password" not in response.text
+    assert app.state.store.tasks(None) == []
+    assert not list((app.state.settings.data_dir / "uploads").glob("*.db"))
+    assert source.read_bytes() == before
+
+
 def test_retry_requires_fresh_password_and_clears_old_secret(console):
     app, client = console
     headers = login(client)

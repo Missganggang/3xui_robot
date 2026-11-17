@@ -108,7 +108,8 @@ def validate_database(path: Path, source_version: str, target_version: str) -> d
         schema = db.execute("SELECT type, sql FROM sqlite_master WHERE sql IS NOT NULL").fetchall()
         if any(kind in {"trigger", "view"} or "CREATE VIRTUAL TABLE" in sql.upper() for kind, sql in schema):
             raise MigrationError("数据库含非标准触发器、视图或虚拟表，不能自动迁移。")
-        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        # SQLite identifiers are case insensitive, including historical tables.
+        tables = {row[0].casefold() for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if not {"users", "settings", "inbounds"}.issubset(tables):
             raise MigrationError("缺少 3x-ui 必需的数据表：users、settings、inbounds。")
         columns = {
@@ -121,10 +122,26 @@ def validate_database(path: Path, source_version: str, target_version: str) -> d
             raise MigrationError("settings 数据表结构无效。")
         if not {"id", "settings"}.issubset(columns["inbounds"]):
             raise MigrationError("inbounds 数据表结构无效。")
-        if source_version == "2.9.4" and "clients" in tables:
-            raise MigrationError("数据库包含 3.x 客户数据表，请核对原面板版本；不支持降级迁移。")
+        if source_version == "2.9.4":
+            # AutoMigrate does not drop tables after a version rollback. Empty
+            # residual tables do not change the 2.x inbound JSON client layout.
+            # Nonempty independent tables cannot safely be ignored, even when
+            # JSON clients also exist: they may be stale copies of 3.x data.
+            independent_clients = db.execute("SELECT count(*) FROM clients").fetchone()[0] if "clients" in tables else 0
+            independent_links = db.execute("SELECT count(*) FROM client_inbounds").fetchone()[0] if "client_inbounds" in tables else 0
+            if independent_clients or independent_links:
+                raise MigrationError(
+                    f"当前选择为 2.9.4 → 2.9.4，但备份的独立客户表 clients 有 {independent_clients} 条记录，"
+                    f"client_inbounds 有 {independent_links} 条关联。2.9.4 只读取入站配置中的客户，"
+                    "不能确认这些独立记录也能恢复，因此已停止以避免客户数据遗漏。"
+                    "表结构不能证明原面板的精确版本；升级或回退可能留下数据表。"
+                    "请核对正在运行的原面板版本并重新导出；若确为 2.9.4，请保留原文件并联系管理员核对这些记录，"
+                    "不要自行删除数据表或改选版本绕过检查。"
+                )
+            if {"clients", "client_inbounds"} & tables:
+                warnings.append("备份含空的独立客户数据表，可能为历史版本遗留；已按声明的 2.9.4 校验入站客户，原文件及数据表保持不变。")
         if source_version == "3.4.2" and "clients" not in tables:
-            raise MigrationError("数据库缺少 3.4.2 的 clients 数据表，请核对原面板版本。")
+            raise MigrationError("当前选择为 3.4.2 → 3.4.2，但备份缺少本工具校验所需的独立 clients 数据表。请核对正在运行的原面板版本并重新导出，不要改选版本绕过检查。")
         inbound_count = db.execute("SELECT count(*) FROM inbounds").fetchone()[0]
         user_count = db.execute("SELECT count(*) FROM users").fetchone()[0]
         if not user_count:
