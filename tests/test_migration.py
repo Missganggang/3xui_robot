@@ -262,6 +262,234 @@ def test_nonempty_residual_table_detection_matches_sqlite_identifier_case_rules(
         validate_database(path, "2.9.4", "2.9.4")
 
 
+def add_deleted_inbound_clients(path: Path) -> None:
+    """Synthetic history separate from the two current inbound JSON clients."""
+    with sqlite3.connect(path) as db:
+        db.executescript("""
+            CREATE TABLE clients (id INTEGER, email TEXT, uuid TEXT, sub_id TEXT,
+                                  password TEXT, auth TEXT);
+            CREATE TABLE client_inbounds (client_id INTEGER, inbound_id INTEGER);
+            INSERT INTO clients VALUES
+                (101, 'history-one', 'history-uuid-one', 'history-sub-one', '', ''),
+                (102, 'history-two', 'history-uuid-two', 'history-sub-two', '', '');
+            INSERT INTO client_inbounds VALUES (101,201), (102,202);
+        """)
+        db.execute("UPDATE inbounds SET settings=?", (json.dumps({"clients": [
+            {"email": "one", "id": "current-uuid-one", "subId": "current-sub-one",
+             "password": "current-password-one", "auth": "current-auth-one"},
+            {"email": "two", "id": "current-uuid-two", "subId": "current-sub-two"},
+        ]}),))
+
+
+@pytest.mark.parametrize("mixed_case", [False, True])
+def test_v2_accepts_only_deleted_inbound_history_and_keeps_every_table_byte_for_byte(tmp_path, mixed_case):
+    path = make_db(tmp_path / "deleted-inbound-history.db")
+    add_deleted_inbound_clients(path)
+    if mixed_case:
+        with sqlite3.connect(path) as db:
+            db.execute("ALTER TABLE clients RENAME TO mixed_clients")
+            db.execute("ALTER TABLE mixed_clients RENAME TO Clients")
+            db.execute("ALTER TABLE client_inbounds RENAME TO mixed_links")
+            db.execute("ALTER TABLE mixed_links RENAME TO Client_Inbounds")
+    before, files = path.read_bytes(), set(tmp_path.iterdir())
+    result = validate_database(path, "2.9.4", "2.9.4")
+    assert result["clients"] == 2 and result["inbounds"] == 1
+    assert result["client_count_kind"] == "入站客户条目"
+    assert result["panel_settings"] == {"port": 8443, "path": "/legacy/"}
+    assert any("已删除入站" in warning and "原样保留" in warning for warning in result["warnings"])
+    assert not any(phrase in warning for warning in result["warnings"] for phrase in ("请管理员", "联系管理员", "等待管理员"))
+    assert result["sha256"] == hashlib.sha256(before).hexdigest()
+    serialized = json.dumps(result)
+    for secret in ("history-one", "history-uuid-one", "history-sub-one", "current-uuid-one",
+                   "current-password-one", "current-auth-one", "old-password-hash"):
+        assert secret not in serialized
+    assert path.read_bytes() == before and set(tmp_path.iterdir()) == files
+
+
+def test_v2_accepts_multiple_deleted_inbound_links_per_historical_client(tmp_path):
+    path = make_db(tmp_path / "multiple-deleted-links.db")
+    add_deleted_inbound_clients(path)
+    with sqlite3.connect(path) as db:
+        db.execute("INSERT INTO client_inbounds VALUES (101,203)")
+    result = validate_database(path, "2.9.4", "2.9.4")
+    assert result["clients"] == 2
+    assert any("已删除入站" in warning for warning in result["warnings"])
+
+
+def test_v2_current_fourteen_clients_with_nine_deleted_inbound_records_counts_only_current_json(tmp_path):
+    path = make_db(tmp_path / "synthetic-fourteen-current-nine-history.db")
+    add_deleted_inbound_clients(path)
+    with sqlite3.connect(path) as db:
+        db.execute("DELETE FROM inbounds")
+        db.execute("DELETE FROM clients")
+        db.execute("DELETE FROM client_inbounds")
+        db.executemany("INSERT INTO inbounds(id,settings,stream_settings,port) VALUES(?,?,?,?)", [
+            (index, json.dumps({"clients": [{"email": f"synthetic-current-{index}", "id": f"synthetic-current-id-{index}"}]}),
+             "{}", 10000 + index) for index in range(1, 15)
+        ])
+        db.executemany("INSERT INTO clients VALUES(?,?,?,?,?,?)", [
+            (index, f"synthetic-history-{index}", f"synthetic-history-id-{index}", "", "", "")
+            for index in range(101, 110)
+        ])
+        db.executemany("INSERT INTO client_inbounds VALUES(?,?)", [(index, index + 100) for index in range(101, 110)])
+    before = path.read_bytes()
+    result = validate_database(path, "2.9.4", "2.9.4")
+    assert result["inbounds"] == 14 and result["clients"] == 14
+    assert any("9" in warning and "已删除入站" in warning for warning in result["warnings"])
+    assert path.read_bytes() == before
+
+
+def test_v2_deleted_inbound_history_allows_absent_optional_credential_columns(tmp_path):
+    path = make_db(tmp_path / "minimal-deleted-history.db")
+    with sqlite3.connect(path) as db:
+        db.executescript("""
+            CREATE TABLE clients (id INTEGER PRIMARY KEY, email TEXT);
+            CREATE TABLE client_inbounds (client_id INTEGER, inbound_id INTEGER);
+            INSERT INTO clients VALUES (101,'history-only');
+            INSERT INTO client_inbounds VALUES (101,201);
+        """)
+    assert validate_database(path, "2.9.4", "2.9.4")["clients"] == 2
+
+
+@pytest.mark.parametrize("mutation", [
+    "DELETE FROM client_inbounds WHERE client_id=101",
+    "DROP TABLE client_inbounds",
+    "DELETE FROM clients WHERE id=101",
+    "UPDATE client_inbounds SET inbound_id=1 WHERE client_id=101",
+    "INSERT INTO client_inbounds VALUES(101,1)",
+    "UPDATE clients SET id=NULL WHERE id=101",
+    "UPDATE clients SET id=0 WHERE id=101",
+    "UPDATE clients SET id=-101 WHERE id=101",
+    "UPDATE clients SET id=101.5 WHERE id=101",
+    "UPDATE clients SET id='not-an-id' WHERE id=101",
+    "UPDATE clients SET id=102 WHERE id=101",
+    "UPDATE client_inbounds SET client_id=NULL WHERE client_id=101",
+    "UPDATE client_inbounds SET inbound_id=NULL WHERE client_id=101",
+    "UPDATE client_inbounds SET inbound_id=0 WHERE client_id=101",
+    "UPDATE client_inbounds SET inbound_id=-201 WHERE client_id=101",
+    "INSERT INTO client_inbounds VALUES(101,201)",
+    "UPDATE clients SET email='' WHERE id=101",
+    "UPDATE clients SET email='   ' WHERE id=101",
+    "UPDATE clients SET email=NULL WHERE id=101",
+    "UPDATE clients SET email=x'0102' WHERE id=101",
+    "ALTER TABLE clients RENAME COLUMN email TO unsupported_email",
+    "ALTER TABLE client_inbounds RENAME COLUMN inbound_id TO unsupported_inbound",
+])
+def test_v2_ambiguous_or_live_independent_history_still_fails_without_mutation(tmp_path, mutation):
+    path = make_db(tmp_path / "unsafe-history.db")
+    add_deleted_inbound_clients(path)
+    with sqlite3.connect(path) as db:
+        db.execute(mutation)
+    before, files = path.read_bytes(), set(tmp_path.iterdir())
+    with pytest.raises(MigrationError, match="客户数据遗漏") as caught:
+        validate_database(path, "2.9.4", "2.9.4")
+    message = str(caught.value)
+    assert "管理员" not in message
+    assert "history-one" not in message and "history-uuid-one" not in message
+    assert path.read_bytes() == before and set(tmp_path.iterdir()) == files
+
+
+@pytest.mark.parametrize("column,current_key", [
+    ("email", "email"), ("uuid", "id"), ("sub_id", "subId"),
+    ("password", "password"), ("auth", "auth"),
+])
+@pytest.mark.parametrize("case_variant", [False, True])
+def test_v2_deleted_history_identity_collision_cannot_hide_current_customer_conflicts(tmp_path, column, current_key, case_variant):
+    path = make_db(tmp_path / "conflicting-history.db")
+    add_deleted_inbound_clients(path)
+    with sqlite3.connect(path) as db:
+        current = json.loads(db.execute("SELECT settings FROM inbounds WHERE id=1").fetchone()[0])["clients"][0]
+        value = current[current_key].upper() if case_variant else current[current_key]
+        db.execute(f"UPDATE clients SET {column}=? WHERE id=101", (value,))
+    before = path.read_bytes()
+    with pytest.raises(MigrationError, match="客户数据遗漏") as caught:
+        validate_database(path, "2.9.4", "2.9.4")
+    assert value not in str(caught.value)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("payload", [
+    [], ["not-a-client"], {"clients": None}, {"clients": {}},
+    {"clients": ["not-a-client"]}, {"clients": [None]},
+])
+def test_v2_deleted_history_does_not_bypass_invalid_current_json_clients(tmp_path, payload):
+    path = make_db(tmp_path / "bad-current-clients.db")
+    add_deleted_inbound_clients(path)
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE inbounds SET settings=?", (json.dumps(payload),))
+    before = path.read_bytes()
+    with pytest.raises(MigrationError, match="JSON"):
+        validate_database(path, "2.9.4", "2.9.4")
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["email", "id", "subId", "password", "auth"])
+def test_v2_deleted_history_requires_current_identity_values_to_have_valid_types(tmp_path, field):
+    path = make_db(tmp_path / "bad-current-identity.db")
+    add_deleted_inbound_clients(path)
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE inbounds SET settings=?", (json.dumps({"clients": [{field: 123}]}),))
+    with pytest.raises(MigrationError, match="客户数据遗漏"):
+        validate_database(path, "2.9.4", "2.9.4")
+
+
+@pytest.mark.parametrize("populated", [False, True])
+def test_v2_historical_api_tokens_are_preserved_with_notice_without_returning_token_values(tmp_path, populated):
+    path = make_db(tmp_path / "historical-api-tokens.db")
+    add_deleted_inbound_clients(path)
+    token = "test-only-private-historical-api-token"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE api_tokens(id INTEGER PRIMARY KEY, token TEXT)")
+        if populated:
+            db.execute("INSERT INTO api_tokens VALUES(1,?)", (token,))
+    before, files = path.read_bytes(), set(tmp_path.iterdir())
+    result = validate_database(path, "2.9.4", "2.9.4")
+    notices = [warning for warning in result["warnings"] if "API 令牌" in warning]
+    assert bool(notices) == populated
+    if populated:
+        assert all("原样保留" in warning and "2.9.4 不读取" in warning for warning in notices)
+    assert token not in json.dumps(result)
+    assert path.read_bytes() == before and set(tmp_path.iterdir()) == files
+
+
+@pytest.mark.parametrize("node_id", [None, 0])
+def test_v2_deleted_inbound_history_accepts_only_local_or_unset_node_ownership(tmp_path, node_id):
+    path = make_db(tmp_path / "local-node-history.db")
+    add_deleted_inbound_clients(path)
+    with sqlite3.connect(path) as db:
+        # No affinity: the checker must distinguish SQLite integers from text
+        # and real values, rather than relying on coercion by an INTEGER column.
+        db.execute("ALTER TABLE inbounds ADD COLUMN node_id")
+        db.execute("UPDATE inbounds SET node_id=?", (node_id,))
+    before = path.read_bytes()
+    result = validate_database(path, "2.9.4", "2.9.4")
+    assert result["clients"] == 2
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("node_id", [1, -1, 0.0, 1.5, "0", "remote-node", b"\x00"])
+def test_v2_deleted_inbound_history_cannot_restore_remote_or_ambiguous_nodes_as_local(tmp_path, node_id):
+    path = make_db(tmp_path / "remote-node-history.db")
+    add_deleted_inbound_clients(path)
+    with sqlite3.connect(path) as db:
+        db.execute("ALTER TABLE inbounds ADD COLUMN node_id")
+        db.execute("UPDATE inbounds SET node_id=?", (node_id,))
+    before, files = path.read_bytes(), set(tmp_path.iterdir())
+    with pytest.raises(MigrationError, match="远程节点归属"):
+        validate_database(path, "2.9.4", "2.9.4")
+    assert path.read_bytes() == before and set(tmp_path.iterdir()) == files
+
+
+def test_v2_historical_node_guard_does_not_reject_v3_node_assignments(tmp_path):
+    path = make_db(tmp_path / "v3-nodes.db", "3.4.2")
+    with sqlite3.connect(path) as db:
+        db.execute("ALTER TABLE inbounds ADD COLUMN node_id")
+        db.execute("UPDATE inbounds SET node_id=7")
+    before = path.read_bytes()
+    assert validate_database(path, "3.4.2", "3.4.2")["clients"] == 3
+    assert path.read_bytes() == before
+
+
 def test_declared_v3_requires_clients_table(tmp_path):
     with pytest.raises(MigrationError, match="clients"):
         validate_database(make_db(tmp_path / "v2.db"), "3.4.2", "3.4.2")

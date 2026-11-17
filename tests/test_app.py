@@ -181,6 +181,43 @@ def test_v294_upload_accepts_empty_residual_client_tables_and_counts_inbound_jso
     assert source.read_bytes() == before
 
 
+def test_customer_migration_and_retry_accept_deleted_inbound_history_without_admin_approval(console, tmp_path):
+    app, client = console
+    customer_password = "test-only-history-customer-password"
+    app.state.store.add_user("history-customer", hash_password(customer_password), "customer")
+    headers = login(client, "history-customer", customer_password)
+    assert client.get("/api/me").json()["user"]["role"] == "customer"
+    assert client.get("/api/admin/users").status_code == 403
+    source = tmp_path / "customer-deleted-history.db"
+    sample_db(source)
+    with sqlite3.connect(source) as db:
+        db.executescript("""
+            CREATE TABLE clients(id INTEGER PRIMARY KEY,email TEXT,uuid TEXT,sub_id TEXT);
+            CREATE TABLE client_inbounds(client_id INTEGER,inbound_id INTEGER);
+            INSERT INTO clients VALUES(101,'test-only-history','history-private-uuid','history-private-sub');
+            INSERT INTO client_inbounds VALUES(101,201);
+        """)
+    before = source.read_bytes()
+    response = client.post("/api/tasks", data=task_data(kind="migrate", source_version="v2.9.4"),
+                           files={"database": ("x-ui.db", before)}, headers=headers)
+    assert response.status_code == 201, response.text
+    task = response.json()["task"]
+    assert task["status"] == "queued" and task["validation"]["clients"] == 1
+    assert any("已删除入站" in warning and "原样保留" in warning for warning in task["validation"]["warnings"])
+    assert not any(phrase in warning for warning in task["validation"]["warnings"] for phrase in ("请管理员", "联系管理员", "等待管理员"))
+    assert task["validation"]["panel_settings"] == {"port": 18443, "path": "/old-panel/"}
+    assert Path(app.state.store.task(task["id"])["upload_path"]).read_bytes() == before
+    for secret in ("test-only-history", "history-private-uuid", "history-private-sub", "old-hash"):
+        assert secret not in response.text
+    app.state.store.finish(task["id"], error="test-only-interrupted-before-ssh")
+    retried = client.post(f"/api/tasks/{task['id']}/retry", json={"ssh_password": "test-only-fresh-password"}, headers=headers)
+    assert retried.status_code == 201, retried.text
+    new_task = retried.json()["task"]
+    assert new_task["status"] == "queued" and new_task["validation"]["clients"] == 1
+    assert Path(app.state.store.task(new_task["id"])["upload_path"]).read_bytes() == before
+    assert source.read_bytes() == before
+
+
 @pytest.mark.parametrize("populated_table", ["clients", "client_inbounds"])
 def test_v294_upload_rejects_independent_clients_or_orphan_links_without_retaining_upload(console, tmp_path, populated_table):
     app, client = console

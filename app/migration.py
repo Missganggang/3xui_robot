@@ -73,6 +73,99 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_v2_residual_clients(
+    db: sqlite3.Connection, tables: set[str], inbound_clients: list[dict[str, Any]],
+) -> list[str]:
+    """Recognize detached historical tables without rewriting the snapshot.
+
+    A rollback can leave normalized clients whose inbound rows were later
+    deleted by 2.x. Only that fully detached shape is accepted here; live or
+    unlinked normalized clients still need a source backup in a known layout.
+    """
+    if not {"clients", "client_inbounds"} & tables:
+        return []
+    clients = db.execute("SELECT count(*) FROM clients").fetchone()[0] if "clients" in tables else 0
+    links = db.execute("SELECT count(*) FROM client_inbounds").fetchone()[0] if "client_inbounds" in tables else 0
+    if not clients and not links:
+        return ["备份含空的独立客户数据表，可能为历史版本遗留；已按声明的 2.9.4 校验入站客户，原文件及数据表保持不变。"]
+
+    def reject(reason: str) -> None:
+        raise MigrationError(
+            f"当前选择为 2.9.4 → 2.9.4，但备份的独立客户表 clients 有 {clients} 条记录，"
+            f"client_inbounds 有 {links} 条关联。{reason}"
+            "2.9.4 只读取入站配置中的客户，不能确认这些独立记录也能恢复，因此已停止以避免客户数据遗漏。"
+            "表结构不能证明原面板的精确版本；升级或回退可能留下数据表。"
+            "请核对正在运行的原面板版本并重新导出完整备份；不要自行删除数据表或改选版本绕过检查。"
+        )
+
+    if not clients or not links:
+        reject("独立客户与关联不完整，无法自动确认为历史残留。")
+    client_columns = {row[1].casefold() for row in db.execute("PRAGMA table_info(clients)")}
+    link_columns = {row[1].casefold() for row in db.execute("PRAGMA table_info(client_inbounds)")}
+    if not {"id", "email"}.issubset(client_columns) or not {"client_id", "inbound_id"}.issubset(link_columns):
+        reject("独立客户或关联表结构不完整，无法核对历史归属。")
+    inbound_columns = {row[1].casefold() for row in db.execute("PRAGMA table_info(inbounds)")}
+    if "node_id" in inbound_columns and db.execute(
+        "SELECT 1 FROM inbounds WHERE node_id IS NOT NULL "
+        "AND (typeof(node_id) != 'integer' OR node_id != 0) LIMIT 1"
+    ).fetchone():
+        reject("当前入站包含远程节点归属，2.9.4 无法按原节点部署方式恢复。")
+    for table in ("clients", "inbounds"):
+        if db.execute(f"SELECT 1 FROM {table} WHERE typeof(id) != 'integer' OR id <= 0 LIMIT 1").fetchone():
+            reject("客户或入站编号无效，无法核对历史归属。")
+        if db.execute(f"SELECT 1 FROM {table} GROUP BY id HAVING count(*) > 1 LIMIT 1").fetchone():
+            reject("客户或入站编号重复，无法核对历史归属。")
+    if db.execute(
+        "SELECT 1 FROM client_inbounds WHERE typeof(client_id) != 'integer' OR client_id <= 0 "
+        "OR typeof(inbound_id) != 'integer' OR inbound_id <= 0 LIMIT 1"
+    ).fetchone():
+        reject("客户关联编号无效，无法核对历史归属。")
+    if db.execute(
+        "SELECT 1 FROM client_inbounds GROUP BY client_id, inbound_id HAVING count(*) > 1 LIMIT 1"
+    ).fetchone():
+        reject("客户入站关联重复，无法确认为标准历史残留。")
+    if db.execute(
+        "SELECT 1 FROM client_inbounds AS link WHERE NOT EXISTS "
+        "(SELECT 1 FROM clients WHERE id = link.client_id) LIMIT 1"
+    ).fetchone():
+        reject("关联表引用了不存在的独立客户，无法确认为历史残留。")
+    if db.execute(
+        "SELECT 1 FROM clients WHERE NOT EXISTS "
+        "(SELECT 1 FROM client_inbounds WHERE client_id = clients.id) LIMIT 1"
+    ).fetchone():
+        reject("存在没有入站关联的独立客户，无法自动确定其用途。")
+    if db.execute(
+        "SELECT 1 FROM client_inbounds AS link WHERE EXISTS "
+        "(SELECT 1 FROM inbounds WHERE id = link.inbound_id) LIMIT 1"
+    ).fetchone():
+        reject("独立客户仍关联当前入站，不能作为已删除入站的历史记录处理。")
+
+    # No customer values enter errors or returned statistics. A collision could
+    # instead be a stale copy of a current customer with conflicting settings.
+    identifiers = {name: set() for name in ("email", "id", "subId", "password", "auth")}
+    for client in inbound_clients:
+        for name, values in identifiers.items():
+            value = client.get(name)
+            if value is not None and not isinstance(value, str):
+                reject("当前入站客户标识类型异常，无法核对历史记录。")
+            if isinstance(value, str) and value:
+                values.add(value.casefold())
+    mapped = {"email": "email", "uuid": "id", "sub_id": "subId", "password": "password", "auth": "auth"}
+    selected = [(column, field) for column, field in mapped.items() if column in client_columns]
+    for row in db.execute("SELECT " + ", ".join(column for column, _ in selected) + " FROM clients"):
+        for value, (_, field) in zip(row, selected):
+            if value is not None and not isinstance(value, str):
+                reject("独立客户标识类型异常，无法确认为历史残留。")
+            if field == "email" and (not value or not value.strip()):
+                reject("独立客户缺少客户标识，无法确认为标准历史残留。")
+            if value and value.casefold() in identifiers[field]:
+                reject("历史独立客户与当前入站客户的标识重叠，无法自动确认两套数据是否一致。")
+    return [
+        f"已自动核对：{clients} 条独立客户记录的 {links} 条关联均仅指向已删除入站，作为历史残留原样保留；"
+        "2.9.4 仅按当前入站 JSON 中的客户恢复和验收，这些历史记录不计入当前客户数。"
+    ]
+
+
 def validate_database(path: Path, source_version: str, target_version: str) -> dict[str, Any]:
     """Inspect an upload without modifying it or creating SQLite sidecar files.
 
@@ -122,24 +215,6 @@ def validate_database(path: Path, source_version: str, target_version: str) -> d
             raise MigrationError("settings 数据表结构无效。")
         if not {"id", "settings"}.issubset(columns["inbounds"]):
             raise MigrationError("inbounds 数据表结构无效。")
-        if source_version == "2.9.4":
-            # AutoMigrate does not drop tables after a version rollback. Empty
-            # residual tables do not change the 2.x inbound JSON client layout.
-            # Nonempty independent tables cannot safely be ignored, even when
-            # JSON clients also exist: they may be stale copies of 3.x data.
-            independent_clients = db.execute("SELECT count(*) FROM clients").fetchone()[0] if "clients" in tables else 0
-            independent_links = db.execute("SELECT count(*) FROM client_inbounds").fetchone()[0] if "client_inbounds" in tables else 0
-            if independent_clients or independent_links:
-                raise MigrationError(
-                    f"当前选择为 2.9.4 → 2.9.4，但备份的独立客户表 clients 有 {independent_clients} 条记录，"
-                    f"client_inbounds 有 {independent_links} 条关联。2.9.4 只读取入站配置中的客户，"
-                    "不能确认这些独立记录也能恢复，因此已停止以避免客户数据遗漏。"
-                    "表结构不能证明原面板的精确版本；升级或回退可能留下数据表。"
-                    "请核对正在运行的原面板版本并重新导出；若确为 2.9.4，请保留原文件并联系管理员核对这些记录，"
-                    "不要自行删除数据表或改选版本绕过检查。"
-                )
-            if {"clients", "client_inbounds"} & tables:
-                warnings.append("备份含空的独立客户数据表，可能为历史版本遗留；已按声明的 2.9.4 校验入站客户，原文件及数据表保持不变。")
         if source_version == "3.4.2" and "clients" not in tables:
             raise MigrationError("当前选择为 3.4.2 → 3.4.2，但备份缺少本工具校验所需的独立 clients 数据表。请核对正在运行的原面板版本并重新导出，不要改选版本绕过检查。")
         inbound_count = db.execute("SELECT count(*) FROM inbounds").fetchone()[0]
@@ -165,6 +240,7 @@ def validate_database(path: Path, source_version: str, target_version: str) -> d
         selected = ["settings"]
         selected += [name for name in ("stream_settings", "sniffing", "allocate") if name in columns["inbounds"]]
         client_count = 0
+        inbound_clients: list[dict[str, Any]] = []
         for row in db.execute("SELECT " + ", ".join(selected) + " FROM inbounds"):
             for index, raw in enumerate(row):
                 if not raw:
@@ -177,12 +253,18 @@ def validate_database(path: Path, source_version: str, target_version: str) -> d
                     raise MigrationError("入站配置不是有效 JSON，请检查原面板备份。") from exc
                 if index == 0 and source_version == "2.9.4":
                     clients = payload.get("clients", []) if isinstance(payload, dict) else []
-                    if isinstance(clients, list):
-                        client_count += len(clients)
+                    if not isinstance(payload, dict) or not isinstance(clients, list) or any(not isinstance(client, dict) for client in clients):
+                        raise MigrationError("入站客户配置不是有效的 JSON 对象列表，请重新导出完整备份。")
+                    client_count += len(clients)
+                    inbound_clients.extend(clients)
                 try:
                     inspect(payload)
                 except RecursionError as exc:
                     raise MigrationError("入站配置嵌套过深。") from exc
+        if source_version == "2.9.4":
+            warnings.extend(_validate_v2_residual_clients(db, tables, inbound_clients))
+            if "api_tokens" in tables and db.execute("SELECT 1 FROM api_tokens LIMIT 1").fetchone():
+                warnings.append("备份中的 3.x API 令牌数据表将原样保留，但 2.9.4 不读取该表；依赖这些令牌的接口需单独核对。")
         if source_version == "3.4.2":
             client_count = db.execute("SELECT count(*) FROM clients").fetchone()[0]
         panel_values: dict[str, Any] = {}
